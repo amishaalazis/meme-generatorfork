@@ -4,10 +4,12 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -44,6 +46,22 @@ func (g subscriptionGate) CanCreate(ctx context.Context, userID string) error {
 	return nil
 }
 
+// ReserveMemeSlot meneruskan reservasi kuota atomik; error domain subscription
+// dipetakan ke error gate meme supaya handler bisa merespons status HTTP tepat.
+func (g subscriptionGate) ReserveMemeSlot(ctx context.Context, userID string, fn func(tx pgx.Tx) error) error {
+	err := g.sub.ReserveMemeSlot(ctx, userID, fn)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, subscription.ErrNotSubscribed):
+		return meme.ErrNotSubscribedGate
+	case errors.Is(err, subscription.ErrQuotaExceeded):
+		return meme.ErrQuotaExceeded
+	default:
+		return err
+	}
+}
+
 func Mount(mux *http.ServeMux, pool *pgxpool.Pool, rdb *redis.Client, s3Client *s3.Client, tokens *token.Manager, cfg config.Config) {
 	authHandler := auth.NewModule(pool, tokens)
 	authMW := middleware.Auth(tokens)
@@ -51,7 +69,7 @@ func Mount(mux *http.ServeMux, pool *pgxpool.Pool, rdb *redis.Client, s3Client *
 	subHandler := subscription.NewModule(pool)
 	subSvc := subscription.NewService(subscription.NewPostgresRepository(pool), subscription.MockGateway{})
 
-	memeHandler := meme.NewModule(pool, s3Client, cfg.Storage, subscriptionGate{sub: subSvc})
+	memeHandler := meme.NewModule(pool, s3Client, cfg, subscriptionGate{sub: subSvc})
 
 	auth.RegisterRoutes(mux, authHandler, authMW)
 	subscription.RegisterRoutes(mux, subHandler, authMW)

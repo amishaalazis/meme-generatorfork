@@ -40,12 +40,45 @@ func (h *Handler) PrepareUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ext := path.Ext(dto.Filename)
-	res, err := h.service.PrepareUpload(r.Context(), userID, dto.Title, ext, dto.Size, dto.ContentType)
+	res, err := h.service.PrepareUpload(r.Context(), userID, dto.Title, ext, dto.Size, dto.ContentType, requestOrigin(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	response.Success(w, http.StatusCreated, CodeUploadPrepared, res, "upload disiapkan")
+}
+
+// requestOrigin menyusun base URL publik API dari request saat ini; dipakai
+// untuk membangun URL upload ber-token yang bisa diikuti klien mana pun.
+func requestOrigin(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		scheme = p
+	}
+	return scheme + "://" + r.Host
+}
+
+// StoreBase: endpoint tujuan PUT gambar dasar (penerus presigned PUT S3).
+// Ukuran body dibatasi keras di sini sehingga file di atas batas tidak pernah
+// sampai ke storage — upload URL ber-token, tanpa sesi/cookie.
+func (h *Handler) StoreBase(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	expires, err := strconv.ParseInt(q.Get("expires"), 10, 64)
+	if err != nil {
+		response.Error(w, http.StatusForbidden, response.CodeUnauthorized, "token upload tidak valid")
+		return
+	}
+	// MaxBytesReader memotong pembacaan di batas + 1 byte agar kelebihan
+	// ukuran terdeteksi meski klien berbohong soal Content-Length.
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes+1)
+	if err := h.service.StoreBaseImage(r.Context(), r.PathValue("id"),
+		q.Get("token"), expires, r.Header.Get("Content-Type"), r.Body); err != nil {
+		writeError(w, err)
+		return
+	}
+	response.Success(w, http.StatusOK, CodeMemeUpdated, nil, "gambar dasar tersimpan")
 }
 
 type completeDTO struct {
@@ -123,10 +156,14 @@ func writeError(w http.ResponseWriter, err error) {
 		response.Error(w, http.StatusBadRequest, response.CodeInvalidImage, err.Error())
 	case errors.Is(err, ErrUploadTooLarge):
 		response.Error(w, http.StatusRequestEntityTooLarge, response.CodeUploadTooLarge, err.Error())
+	case errors.Is(err, ErrUploadToken):
+		response.Error(w, http.StatusForbidden, response.CodeUnauthorized, err.Error())
 	case errors.Is(err, ErrNotFound):
 		response.Error(w, http.StatusNotFound, response.CodeMemeNotFound, err.Error())
 	case errors.Is(err, ErrNotSubscribedGate):
 		response.Error(w, http.StatusForbidden, response.CodeNotSubscribed, ErrNotSubscribedGate.Error())
+	case errors.Is(err, ErrQuotaExceeded):
+		response.Error(w, http.StatusForbidden, response.CodeQuotaExceeded, err.Error())
 	default:
 		slog.Error("meme handler: internal error", "err", err)
 		response.Error(w, http.StatusInternalServerError, response.CodeInternalServer, "internal server error")

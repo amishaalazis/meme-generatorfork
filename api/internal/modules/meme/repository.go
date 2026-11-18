@@ -17,13 +17,21 @@ func NewPostgresRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-func (r *Repository) Create(ctx context.Context, m Meme) (Meme, error) {
-	const q = `
-		INSERT INTO memes (user_id, title, base_url, top_text, bottom_text, font_size)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, user_id, title, base_url, result_url, top_text, bottom_text, font_size, created_at`
+// Querier abstraksi sumber query (pool maupun tx) supaya insert meme bisa
+// berjalan di transaksi yang sama dengan pemeriksaan kuota (ReserveMemeSlot).
+// *pgxpool.Pool dan pgx.Tx keduanya memenuhi interface ini.
+type Querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+const sqlCreateMeme = `
+	INSERT INTO memes (user_id, title, base_url, top_text, bottom_text, font_size)
+	VALUES ($1, $2, $3, $4, $5, $6)
+	RETURNING id, user_id, title, base_url, result_url, top_text, bottom_text, font_size, created_at`
+
+func (r *Repository) Create(ctx context.Context, q Querier, m Meme) (Meme, error) {
 	var out Meme
-	err := r.pool.QueryRow(ctx, q,
+	err := q.QueryRow(ctx, sqlCreateMeme,
 		m.UserID, m.Title, m.BaseImageURL, m.TopText, m.BottomText, m.FontSize,
 	).Scan(&out.ID, &out.UserID, &out.Title, &out.BaseImageURL, &out.ResultURL,
 		&out.TopText, &out.BottomText, &out.FontSize, &out.CreatedAt)
@@ -31,6 +39,21 @@ func (r *Repository) Create(ctx context.Context, m Meme) (Meme, error) {
 		return Meme{}, fmt.Errorf("meme repository: create gagal: %w", err)
 	}
 	return out, nil
+}
+
+// GetBaseImageURL mengambil URL publik gambar dasar meme (dipakai endpoint
+// upload ber-token yang tidak membawa sesi user).
+func (r *Repository) GetBaseImageURL(ctx context.Context, id string) (string, error) {
+	var baseURL string
+	err := r.pool.QueryRow(ctx,
+		`SELECT base_url FROM memes WHERE id = $1`, id).Scan(&baseURL)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("meme repository: get base url gagal: %w", err)
+	}
+	return baseURL, nil
 }
 
 func (r *Repository) GetByID(ctx context.Context, id, userID string) (Meme, error) {

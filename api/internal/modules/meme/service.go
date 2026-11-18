@@ -1,13 +1,22 @@
 package meme
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/nyxsr/meme-portal/api/internal/config"
 	"github.com/nyxsr/meme-portal/api/internal/platform/token"
@@ -17,6 +26,10 @@ import (
 // Diimplementasikan oleh modul subscription lewat structural typing.
 type Gate interface {
 	CanCreate(ctx context.Context, userID string) error
+	// ReserveMemeSlot mengamankan satu slot kuota secara atomik: cek kuota
+	// dan pembuatan record meme (fn) berjalan dalam SATU transaksi berkunci
+	// per user, sehingga request paralel tidak bisa menembus kuota.
+	ReserveMemeSlot(ctx context.Context, userID string, fn func(tx pgx.Tx) error) error
 }
 
 type Service struct {
@@ -24,19 +37,24 @@ type Service struct {
 	s3      *s3.Client
 	bucket  string
 	baseURL string // public base URL Garage web endpoint
+	secret  string // HMAC secret untuk token URL upload gambar dasar
 	gate    Gate
 }
 
-func NewService(repo *Repository, s3Client *s3.Client, cfg config.StorageConfig, gate Gate) *Service {
-	return &Service{repo: repo, s3: s3Client, bucket: cfg.Bucket, baseURL: cfg.PublicBaseURL, gate: gate}
+func NewService(repo *Repository, s3Client *s3.Client, cfg config.StorageConfig, secret string, gate Gate) *Service {
+	return &Service{
+		repo: repo, s3: s3Client,
+		bucket: cfg.Bucket, baseURL: cfg.PublicBaseURL,
+		secret: secret, gate: gate,
+	}
 }
 
-// PrepareUpload membuat record meme (pending) dan mengembalikan presigned PUT URL
-// untuk mengunggah gambar dasar langsung ke S3/Garage.
-func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext string, size int64, contentType string) (UploadResponse, error) {
-	if err := s.gate.CanCreate(ctx, userID); err != nil {
-		return UploadResponse{}, err
-	}
+// PrepareUpload membuat record meme (pending) dan mengembalikan URL upload
+// gambar dasar. Berbeda dari presigned PUT langsung ke S3, upload berjalan
+// lewat endpoint API ber-token sehingga ukuran file diberlakukan sungguhan
+// di server — klien yang tidak mengirim field size (kontrak lama) pun tidak
+// bisa menyimpan object di atas batas.
+func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext string, size int64, contentType, origin string) (UploadResponse, error) {
 	contentType = normalizeContentType(contentType)
 	// Ekstensi wajib ada — langsung dari filename atau diturunkan dari
 	// contentType yang diizinkan (klien lama kadang tidak mengirim ekstensi).
@@ -46,44 +64,118 @@ func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext string, 
 	if !allowedExt(ext) {
 		return UploadResponse{}, ErrInvalidFile
 	}
-	// size == 0 berarti klien tidak mengirim ukuran (opsional sejak kontrak
-	// awal API); jangan menolak, cukup lewati pin Content-Length di presign.
+	// Penolakan dini untuk klaim ukuran yang jelas-jelas melampaui batas;
+	// ukuran sesungguhnya tetap divalidasi saat body diterima (StoreBaseImage)
+	// karena klaim klien tidak bisa dipercaya.
 	if size > maxUploadBytes {
 		return UploadResponse{}, ErrUploadTooLarge
 	}
 	ext = strings.ToLower(ext)
 	objectKey := fmt.Sprintf("base/%s%s", token.RandomHex(12), ext)
 
-	m, err := s.repo.Create(ctx, Meme{
-		UserID: userID, Title: title,
-		BaseImageURL: s.publicURL(objectKey),
+	// Cek kuota + insert record meme dalam satu transaksi berkunci (TKT-109):
+	// request paralel untuk user yang sama terserialisasi di gerbang ini.
+	var m Meme
+	err := s.gate.ReserveMemeSlot(ctx, userID, func(tx pgx.Tx) error {
+		created, cerr := s.repo.Create(ctx, tx, Meme{
+			UserID: userID, Title: title,
+			BaseImageURL: s.publicURL(objectKey),
+		})
+		if cerr == nil {
+			m = created
+		}
+		return cerr
 	})
 	if err != nil {
 		return UploadResponse{}, err
 	}
 
 	uploadContentType := contentTypeForExt(ext)
-	presign := s3.NewPresignClient(s.s3)
-	input := &s3.PutObjectInput{
-		Bucket:      &s.bucket,
-		Key:         &objectKey,
-		ContentType: aws.String(uploadContentType),
-	}
-	// Hanya pin Content-Length bila ukurannya dikirim klien; header ini ikut
-	// ditandatangani, sehingga PUT dengan panjang body berbeda akan ditolak.
-	if size > 0 {
-		input.ContentLength = aws.Int64(size)
-	}
-	req, err := presign.PresignPutObject(ctx, input, s3.WithPresignExpires(maxPresignTTL))
-	if err != nil {
-		return UploadResponse{}, fmt.Errorf("meme service: presign gagal: %w", err)
-	}
+	expires := time.Now().Add(maxUploadTTL)
 	return UploadResponse{
 		ID:          m.ID,
-		UploadURL:   req.URL,
+		UploadURL:   s.uploadURL(origin, m.ID, expires),
 		BaseURL:     m.BaseImageURL,
 		ContentType: uploadContentType,
 	}, nil
+}
+
+// StoreBaseImage menerima body gambar dasar dari endpoint upload ber-token:
+// memvalidasi token & tipe, membatasi ukuran secara keras, lalu menyimpannya
+// ke S3/Garage. Inilah titik enforcement ukuran yang tidak bisa dilewati
+// klien — berbeda dari presigned PUT yang tidak berbatas tanpa Content-Length.
+func (s *Service) StoreBaseImage(ctx context.Context, id, rawToken string, expires int64, contentType string, body io.Reader) error {
+	if !verifyUploadToken(s.secret, id, rawToken, expires) {
+		return ErrUploadToken
+	}
+	baseImageURL, err := s.repo.GetBaseImageURL(ctx, id)
+	if err != nil {
+		return err
+	}
+	ext := path.Ext(baseImageURL)
+	if !allowedExt(ext) {
+		return ErrInvalidFile
+	}
+	uploadContentType := contentTypeForExt(ext)
+	if ct := normalizeContentType(contentType); ct != "" && ct != uploadContentType {
+		return ErrInvalidFile
+	}
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return ErrUploadTooLarge
+		}
+		return fmt.Errorf("meme service: baca body upload gagal: %w", err)
+	}
+	if int64(len(data)) > maxUploadBytes {
+		return ErrUploadTooLarge
+	}
+
+	key := s.objectKeyOf(baseImageURL)
+	if _, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        &s.bucket,
+		Key:           &key,
+		Body:          bytes.NewReader(data),
+		ContentType:   aws.String(uploadContentType),
+		ContentLength: aws.Int64(int64(len(data))),
+	}); err != nil {
+		return fmt.Errorf("meme service: simpan gambar dasar gagal: %w", err)
+	}
+	return nil
+}
+
+// uploadURL menyusun URL endpoint upload gambar dasar ber-token (penerus
+// presigned PUT untuk base image).
+func (s *Service) uploadURL(origin, id string, expires time.Time) string {
+	return fmt.Sprintf("%s/api/v1/memes/upload/%s/file?expires=%d&token=%s",
+		strings.TrimRight(origin, "/"), id, expires.Unix(),
+		uploadToken(s.secret, id, expires))
+}
+
+// objectKeyOf mengembalikan object key S3 dari URL publiknya.
+func (s *Service) objectKeyOf(publicURL string) string {
+	if s.baseURL == "" {
+		return publicURL
+	}
+	return strings.TrimPrefix(publicURL, strings.TrimRight(s.baseURL, "/")+"/")
+}
+
+// uploadToken: HMAC-SHA256(id|expires) — mengikat token ke meme & masa berlaku.
+func uploadToken(secret, id string, expires time.Time) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	fmt.Fprintf(mac, "%s|%d", id, expires.Unix())
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifyUploadToken(secret, id, raw string, expires int64) bool {
+	if raw == "" || time.Now().Unix() > expires {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	fmt.Fprintf(mac, "%s|%d", id, expires)
+	return hmac.Equal([]byte(raw), []byte(hex.EncodeToString(mac.Sum(nil))))
 }
 
 // ResultUpload mengembalikan presigned PUT URL untuk gambar hasil render

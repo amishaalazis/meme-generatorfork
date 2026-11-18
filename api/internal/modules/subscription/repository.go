@@ -265,3 +265,61 @@ func (r *Repository) MemesUsed(ctx context.Context, userID string, since time.Ti
 	}
 	return n, nil
 }
+
+// ReserveMemeSlot mengamankan SATU slot kuota meme secara atomik.
+//
+// Cek kuota yang terpisah dari insert (CanCreate lalu Create) punya race:
+// banyak request paralel bisa lolos cek bersamaan sebelum ada insert yang
+// commit (TKT-109). Di sini cek langganan + hitung pemakaian + insert record
+// meme (lewat fn) berjalan dalam SATU transaksi yang memegang advisory lock
+// per user, sehingga request paralel untuk user yang sama terserialisasi.
+// fn menerima transaksi agar insert berjalan di koneksi yang sama — mencegah
+// deadlock koneksi pool saat banyak request menunggu giliran.
+func (r *Repository) ReserveMemeSlot(ctx context.Context, userID string, fn func(tx pgx.Tx) error) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("subscription repository: begin gagal: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, userID,
+	); err != nil {
+		return fmt.Errorf("subscription repository: lock kuota gagal: %w", err)
+	}
+
+	var duration, maxMemes int32
+	err = tx.QueryRow(ctx, `
+		SELECT p.duration_days, p.max_memes
+		FROM subscriptions s
+		JOIN plans p ON p.id = s.plan_id
+		WHERE s.user_id = $1 AND s.status = 'active' AND s.ends_at > now()
+		ORDER BY s.ends_at DESC LIMIT 1`, userID,
+	).Scan(&duration, &maxMemes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotSubscribed
+	}
+	if err != nil {
+		return fmt.Errorf("subscription repository: active by user gagal: %w", err)
+	}
+
+	var used int32
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM memes
+		WHERE user_id = $1 AND created_at >= now() - ($2::int * interval '1 day')`,
+		userID, duration,
+	).Scan(&used); err != nil {
+		return fmt.Errorf("subscription repository: memes used gagal: %w", err)
+	}
+	if maxMemes > 0 && used >= maxMemes {
+		return ErrQuotaExceeded
+	}
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("subscription repository: commit gagal: %w", err)
+	}
+	return nil
+}

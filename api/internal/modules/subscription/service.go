@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/nyxsr/meme-portal/api/internal/platform/token"
 )
 
@@ -77,6 +79,13 @@ func (s *Service) Checkout(ctx context.Context, userID string, dto CheckoutDTO, 
 // Confirm mensimulasikan callback payment gateway sukses.
 func (s *Service) Confirm(ctx context.Context, reference string) (Subscription, Payment, error) {
 	return s.repo.ConfirmPayment(ctx, reference)
+}
+
+// ReserveMemeSlot mengamankan satu slot kuota meme secara atomik; fn membuat
+// record meme di dalam transaksi berkunci yang sama. Lihat
+// Repository.ReserveMemeSlot untuk detail pencegahan race kuota.
+func (s *Service) ReserveMemeSlot(ctx context.Context, userID string, fn func(tx pgx.Tx) error) error {
+	return s.repo.ReserveMemeSlot(ctx, userID, fn)
 }
 
 // MarkExpired menandai langganan aktif yang sudah lewat masa aktif
