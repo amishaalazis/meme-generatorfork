@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -44,6 +45,12 @@ func bootstrap(ctx context.Context, cfg config.Config) (deps *dependencies, err 
 	s3Client, err := storage.NewStorage(ctx, cfg.Storage)
 	if err != nil {
 		return nil, err
+	}
+	// Pastikan bucket mengizinkan PUT langsung dari browser (presigned URL).
+	// Kegagalan di sini tidak fatal: aplikasi tetap jalan, hanya upload
+	// langsung dari browser yang akan ditolak CORS.
+	if err := storage.EnsureBucketCORS(ctx, s3Client, cfg.Storage.Bucket, cfg.AllowedOrigins); err != nil {
+		slog.Warn("bootstrap: gagal menyetel CORS bucket", "err", err)
 	}
 
 	return &dependencies{db: db, redis: redisClient, s3: s3Client}, nil

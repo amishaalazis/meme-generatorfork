@@ -1,0 +1,1 @@
+UPDATE plans SET max_memes = 0 WHERE code IN ('premium_1d', 'premium_3d', 'premium_30d', 'premium_60d', 'premium_90d');
