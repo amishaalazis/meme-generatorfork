@@ -27,7 +27,8 @@ func RegisterRoutes(mux *http.ServeMux, h *Handler, authMW func(http.Handler) ht
 			h.Status(w, r)
 		})))
 	mux.Handle("POST /api/v1/subscription/checkout", authMW(http.HandlerFunc(h.Checkout)))
-	// /confirm dijaga authMW agar hanya pemilik sesi yang bisa mengonfirmasi pembayaran.
-	mux.Handle("POST /api/v1/subscription/payments/{reference}/confirm",
-		authMW(http.HandlerFunc(h.Confirm)))
+	// /confirm adalah callback payment gateway: dipanggil server-to-server
+	// tanpa sesi/cookie user. Reference transaksi berfungsi sebagai rahasia
+	// bearer yang tidak bisa ditebak; jangan pasang authMW di sini.
+	mux.HandleFunc("POST /api/v1/subscription/payments/{reference}/confirm", h.Confirm)
 }
