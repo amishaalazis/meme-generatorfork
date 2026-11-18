@@ -37,14 +37,19 @@ func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext string, 
 	if err := s.gate.CanCreate(ctx, userID); err != nil {
 		return UploadResponse{}, err
 	}
-	if !allowedExt(ext) || size <= 0 {
+	contentType = normalizeContentType(contentType)
+	// Ekstensi wajib ada — langsung dari filename atau diturunkan dari
+	// contentType yang diizinkan (klien lama kadang tidak mengirim ekstensi).
+	if !allowedExt(ext) && allowedContentType(contentType) {
+		ext = extForContentType(contentType)
+	}
+	if !allowedExt(ext) {
 		return UploadResponse{}, ErrInvalidFile
 	}
+	// size == 0 berarti klien tidak mengirim ukuran (opsional sejak kontrak
+	// awal API); jangan menolak, cukup lewati pin Content-Length di presign.
 	if size > maxUploadBytes {
 		return UploadResponse{}, ErrUploadTooLarge
-	}
-	if contentType != "" && !allowedContentType(contentType) {
-		return UploadResponse{}, ErrInvalidFile
 	}
 	ext = strings.ToLower(ext)
 	objectKey := fmt.Sprintf("base/%s%s", token.RandomHex(12), ext)
@@ -60,10 +65,14 @@ func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext string, 
 	uploadContentType := contentTypeForExt(ext)
 	presign := s3.NewPresignClient(s.s3)
 	input := &s3.PutObjectInput{
-		Bucket:        &s.bucket,
-		Key:           &objectKey,
-		ContentLength: aws.Int64(size),
-		ContentType:   aws.String(uploadContentType),
+		Bucket:      &s.bucket,
+		Key:         &objectKey,
+		ContentType: aws.String(uploadContentType),
+	}
+	// Hanya pin Content-Length bila ukurannya dikirim klien; header ini ikut
+	// ditandatangani, sehingga PUT dengan panjang body berbeda akan ditolak.
+	if size > 0 {
+		input.ContentLength = aws.Int64(size)
 	}
 	req, err := presign.PresignPutObject(ctx, input, s3.WithPresignExpires(maxPresignTTL))
 	if err != nil {
@@ -151,15 +160,28 @@ func contentTypeForExt(ext string) string {
 	return imageContentTypes[strings.ToLower(ext)]
 }
 
-func allowedContentType(contentType string) bool {
+// contentTypeExts memetakan MIME type gambar → ekstensi objek. "image/jpg"
+// adalah alias tidak resmi yang sering dikirim klien; diterima sebagai JPEG.
+var contentTypeExts = map[string]string{
+	"image/jpeg": ".jpg",
+	"image/jpg":  ".jpg",
+	"image/png":  ".png",
+	"image/gif":  ".gif",
+	"image/webp": ".webp",
+}
+
+func normalizeContentType(contentType string) string {
 	if i := strings.IndexByte(contentType, ';'); i >= 0 {
 		contentType = contentType[:i]
 	}
-	contentType = strings.ToLower(strings.TrimSpace(contentType))
-	for _, allowed := range imageContentTypes {
-		if contentType == allowed {
-			return true
-		}
-	}
-	return false
+	return strings.ToLower(strings.TrimSpace(contentType))
+}
+
+func allowedContentType(contentType string) bool {
+	_, ok := contentTypeExts[normalizeContentType(contentType)]
+	return ok
+}
+
+func extForContentType(contentType string) string {
+	return contentTypeExts[normalizeContentType(contentType)]
 }
