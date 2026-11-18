@@ -101,11 +101,15 @@ function drawMeme(
   }
 }
 
-async function putToS3(uploadUrl: string, blob: Blob) {
+async function putToS3(
+  uploadUrl: string,
+  blob: Blob,
+  contentType = blob.type,
+) {
   const res = await fetch(uploadUrl, {
     method: "PUT",
     body: blob,
-    headers: { "Content-Type": blob.type },
+    headers: { "Content-Type": contentType },
   });
   if (!res.ok) throw new Error(`upload ke S3 gagal: ${res.status}`);
 }
@@ -113,6 +117,7 @@ async function putToS3(uploadUrl: string, blob: Blob) {
 interface ResultUploadData {
   uploadUrl: string;
   baseUrl: string;
+  contentType: string;
 }
 
 export default function StudioPage() {
@@ -165,9 +170,13 @@ export default function StudioPage() {
       imgRef.current = img;
 
       // 1) presign gambar dasar
-      const prepared = await prepare.mutateAsync({ title, filename: file.name });
+      const prepared = await prepare.mutateAsync({
+        title,
+        filename: file.name,
+        size: file.size,
+      });
       // 2) unggah gambar dasar ke Garage
-      await putToS3(prepared.uploadUrl, file);
+      await putToS3(prepared.uploadUrl, file, prepared.contentType);
 
       // 3) render hasil ke PNG
       const resultCanvas = document.createElement("canvas");
@@ -183,13 +192,19 @@ export default function StudioPage() {
       const result = unwrap<ResultUploadData>(
         await api.post(`/api/v1/memes/${prepared.id}/result-upload`),
       );
-      await putToS3(result.uploadUrl, blob);
+      await putToS3(result.uploadUrl, blob, result.contentType);
 
       // 5) complete
       await complete.mutateAsync({ id: prepared.id, resultUrl: result.baseUrl });
       memes.refetch();
     } catch (err) {
       setError(describeError(err));
+      // Jika ditolak karena paket habis (403), refresh status langganan
+      // agar UI langsung menampilkan kondisi tidak berlangganan.
+      const e = err as { response?: { status?: number } };
+      if (e?.response?.status === 403) {
+        status.refetch();
+      }
     } finally {
       setBusy(false);
     }

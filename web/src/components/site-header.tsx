@@ -85,10 +85,15 @@ export function SiteHeader() {
               <HoverCard openDelay={100} closeDelay={150}>
                 <HoverCardTrigger asChild>
                   <button
-                    className="cursor-pointer rounded px-2 py-1 text-sm text-muted-foreground underline-offset-4 hover:underline"
+                    className="cursor-pointer rounded px-2 py-1 text-sm text-muted-foreground underline-offset-4 hover:underline flex items-center gap-2"
                     aria-label="Info akun"
                   >
-                    {user.name || user.email}
+                    <span>{user.name || user.email}</span>
+                    {sub.data?.subscribed && sub.data.planName && (
+                      <span className="rounded bg-primary/10 px-1.5 py-0.5 text-xs font-medium text-primary">
+                        {sub.data.planName}
+                      </span>
+                    )}
                   </button>
                 </HoverCardTrigger>
                 <HoverCardContent className="w-72" align="end">
@@ -104,7 +109,7 @@ export function SiteHeader() {
                     {sub.data?.subscribed ? (
                       <>
                         <p className="text-muted-foreground">
-                          Paket: {sub.data.planName}
+                          Paket: <span className="font-medium text-foreground">{sub.data.planName}</span>
                         </p>
                         <p className="text-muted-foreground">
                           Berakhir dalam{" "}

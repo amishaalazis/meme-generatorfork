@@ -1,23 +1,14 @@
 "use client";
 
-// Halaman depan dengan guard auth. BUG: jika !me.data dialihkan ke /login,
-// sementara /login mengembalikan ke sini bila cookie masih ada —
-// kombinasi keduanya bisa menghasilkan redirect loop tak berujung.
-import { useEffect } from "react";
+// Halaman depan: tampil untuk semua user (login maupun tidak).
+// Tidak ada paksa-redirect — link ke /studio dan /pricing sudah cukup.
+// Guard per-halaman (studio, dll.) masing-masing menangani kasus belum login.
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { useMe } from "@/lib/auth";
 
 export default function Home() {
-  const router = useRouter();
   const me = useMe();
-
-  useEffect(() => {
-    if (!me.isLoading && !me.data) {
-      router.replace("/login");
-    }
-  }, [me.isLoading, me.data, router]);
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-8 p-8">
@@ -38,6 +29,11 @@ export default function Home() {
         <Button asChild variant="outline">
           <Link href="/pricing">Lihat Paket</Link>
         </Button>
+        {!me.isLoading && !me.data && (
+          <Button asChild variant="ghost">
+            <Link href="/login">Masuk</Link>
+          </Button>
+        )}
       </div>
     </main>
   );

@@ -57,8 +57,18 @@ export function useLogout() {
   return useMutation({
     mutationFn: async () => api.post("/api/v1/auth/logout"),
     onSuccess: () => {
+      // Hapus seluruh cache React Query agar data user lama tidak tersisa,
+      // lalu arahkan ke /login — bukan "/" — untuk menghindari redirect loop
+      // jika "/" masih mencoba mendeteksi sesi yang baru saja dihapus.
       qc.clear();
-      window.location.href = "/";
+      window.location.href = "/login";
+    },
+    onError: () => {
+      // Logout gagal di server (mis. Redis down) tapi cookie sudah dikirim
+      // untuk dihapus oleh backend. Tetap clear cache dan arahkan ke /login
+      // agar user tidak terjebak di halaman yang memerlukan autentikasi.
+      qc.clear();
+      window.location.href = "/login";
     },
   });
 }

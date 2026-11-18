@@ -16,9 +16,10 @@ type Meme struct {
 }
 
 type UploadResponse struct {
-	ID        string `json:"id"`
-	UploadURL string `json:"uploadUrl"`
-	BaseURL   string `json:"baseUrl"`
+	ID          string `json:"id"`
+	UploadURL   string `json:"uploadUrl"`
+	BaseURL     string `json:"baseUrl"`
+	ContentType string `json:"contentType"`
 }
 
 type ListResponse struct {

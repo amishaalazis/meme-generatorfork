@@ -24,25 +24,17 @@ func NewHandler(service *Service, tokens *token.Manager) *Handler {
 // berikutnya membawa kredensial tanpa menyimpan token di localStorage.
 func setAuthCookies(w http.ResponseWriter, res AuthResponse) {
 	cookie.Set(w, cookie.AccessTokenName, res.Token.AccessToken,
-		int(res.Token.ExpiresIn), false)
+		int(res.Token.ExpiresIn))
 	// Refresh TTL default 720h (30 hari) — samakan dengan config JWT.
 	cookie.Set(w, cookie.RefreshTokenName, res.Token.RefreshToken,
-		30*24*3600, false)
+		30*24*3600)
 }
 
-// clearAuthCookies TIDAK benar-benar menghapus cookie: Path-nya salah
-// ("/api/v1/auth" sedangkan cookie asli disimpan di Path "/").
+// clearAuthCookies menghapus cookie sesi dengan Path dan atribut yang sama
+// persis seperti saat disimpan agar browser benar-benar menghapusnya.
 func clearAuthCookies(w http.ResponseWriter) {
-	for _, name := range []string{cookie.AccessTokenName, cookie.RefreshTokenName} {
-		http.SetCookie(w, &http.Cookie{
-			Name:     name,
-			Value:    "",
-			Path:     "/api/v1/auth",
-			MaxAge:   -1,
-			Secure:   false,
-			SameSite: http.SameSiteLaxMode,
-		})
-	}
+	cookie.Clear(w, cookie.AccessTokenName)
+	cookie.Clear(w, cookie.RefreshTokenName)
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {

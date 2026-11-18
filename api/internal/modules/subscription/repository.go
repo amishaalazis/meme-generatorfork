@@ -120,6 +120,34 @@ func (r *Repository) CheckoutByIdempotencyKey(ctx context.Context, key string) (
 	return res, true, nil
 }
 
+// PendingByUserAndPlan mencari checkout pending yang belum dibayar untuk user dan paket yang sama.
+func (r *Repository) PendingByUserAndPlan(ctx context.Context, userID, planID string) (CheckoutResponse, bool, error) {
+	const q = `
+		SELECT s.id, s.user_id, s.plan_id, s.status, s.starts_at, s.ends_at,
+		       p.id, p.subscription_id, p.amount_idr, p.status, p.reference
+		FROM payments p
+		JOIN subscriptions s ON s.id = p.subscription_id
+		WHERE s.user_id = $1 AND s.plan_id = $2 AND s.status = 'pending' AND p.status = 'pending'
+		ORDER BY p.created_at DESC LIMIT 1`
+	var (
+		res CheckoutResponse
+	)
+	err := r.pool.QueryRow(ctx, q, userID, planID).Scan(
+		&res.Subscription.ID, &res.Subscription.UserID, &res.Subscription.PlanID,
+		&res.Subscription.Status, &res.Subscription.StartsAt, &res.Subscription.EndsAt,
+		&res.Payment.ID, &res.Payment.SubscriptionID, &res.Payment.AmountIDR,
+		&res.Payment.Status, &res.Payment.Reference,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CheckoutResponse{}, false, nil
+	}
+	if err != nil {
+		return CheckoutResponse{}, false, fmt.Errorf("subscription repository: lookup pending gagal: %w", err)
+	}
+	res.MockGatewayURL = "/api/v1/subscription/payments/" + res.Payment.Reference + "/confirm"
+	return res, true, nil
+}
+
 // ConfirmPayment menandai pembayaran lunas (lookup via reference) dan
 // mengaktifkan langganan (transaksi).
 func (r *Repository) ConfirmPayment(ctx context.Context, reference string) (Subscription, Payment, error) {
@@ -137,6 +165,27 @@ func (r *Repository) ConfirmPayment(ctx context.Context, reference string) (Subs
 		reference,
 	).Scan(&pay.ID, &pay.SubscriptionID, &pay.AmountIDR, &pay.Status, &pay.Reference)
 	if errors.Is(err, pgx.ErrNoRows) {
+		// Jika pembayaran dengan reference ini sudah berstatus 'paid' sebelumnya
+		// (misalnya karena double click, retry jaringan, atau konfirmasi berulang),
+		// kembalikan data pembayaran & langganan aktif yang sudah lunas (idempoten).
+		var existingPay Payment
+		var existingSub Subscription
+		checkErr := tx.QueryRow(ctx, `
+			SELECT p.id, p.subscription_id, p.amount_idr, p.status, p.reference,
+			       s.id, s.user_id, s.plan_id, s.status, s.starts_at, s.ends_at
+			FROM payments p
+			JOIN subscriptions s ON s.id = p.subscription_id
+			WHERE p.reference = $1`, reference,
+		).Scan(
+			&existingPay.ID, &existingPay.SubscriptionID, &existingPay.AmountIDR,
+			&existingPay.Status, &existingPay.Reference,
+			&existingSub.ID, &existingSub.UserID, &existingSub.PlanID,
+			&existingSub.Status, &existingSub.StartsAt, &existingSub.EndsAt,
+		)
+		if checkErr == nil && existingPay.Status == "paid" {
+			_ = tx.Commit(ctx)
+			return existingSub, existingPay, nil
+		}
 		return Subscription{}, Payment{}, ErrPaymentFailed
 	}
 	if err != nil {
@@ -169,7 +218,7 @@ func (r *Repository) ActiveByUser(ctx context.Context, userID string) (Subscript
 		       p.id, p.code, p.name, p.price_idr, p.duration_days, p.max_memes, p.active
 		FROM subscriptions s
 		JOIN plans p ON p.id = s.plan_id
-		WHERE s.user_id = $1 AND s.status = 'active'
+		WHERE s.user_id = $1 AND s.status = 'active' AND s.ends_at > now()
 		ORDER BY s.ends_at DESC LIMIT 1`
 	var (
 		sub Subscription
@@ -184,6 +233,9 @@ func (r *Repository) ActiveByUser(ctx context.Context, userID string) (Subscript
 	}
 	if err != nil {
 		return Subscription{}, Plan{}, fmt.Errorf("subscription repository: active by user gagal: %w", err)
+	}
+	if sub.EndsAt != nil && sub.EndsAt.Before(time.Now()) {
+		return Subscription{}, Plan{}, ErrNotSubscribed
 	}
 	return sub, p, nil
 }

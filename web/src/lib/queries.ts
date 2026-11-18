@@ -6,6 +6,7 @@ import {
 import { api, unwrap } from "@/lib/api";
 import type {
   CheckoutResponse,
+  ConfirmResponse,
   Meme,
   Plan,
   SubscriptionStatus,
@@ -31,28 +32,30 @@ export function useSubscriptionStatus() {
     queryKey: queryKeys.subscription,
     queryFn: async () =>
       unwrap<SubscriptionStatus>(await api.get("/api/v1/subscription/status")),
-    // BUG: status dianggap abadi — setelah beli/expired, UI tidak pernah
-    // mengambil ulang sampai invalidate manual / reload penuh.
-    staleTime: Number.POSITIVE_INFINITY,
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
+    refetchInterval: 60 * 1000,
   });
 }
 
 export function useCheckout() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (planCode: string) =>
+    mutationFn: async ({ planCode, idempotencyKey }: { planCode: string; idempotencyKey: string }) =>
       unwrap<CheckoutResponse>(
         await api.post("/api/v1/subscription/checkout", { planCode }, {
           headers: {
-            // BUG: key dibuat BARU di setiap panggilan mutationFn — artinya
-            // setiap klik (termasuk double-click) dianggap maksud berbeda.
-            // Key yang benar dibuat sekali per maksud (mis. per plan yang
-            // dipilih) lalu dipakai ulang saat retry.
-            "Idempotency-Key": crypto.randomUUID(),
+            // Key dibuat sekali di sisi pemanggil (per intent/klik),
+            // bukan per eksekusi mutationFn, agar retry/double-click
+            // menghasilkan checkout yang sama dan tidak duplikat.
+            "Idempotency-Key": idempotencyKey,
           },
         }),
       ),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.subscription }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: queryKeys.subscription });
+    },
   });
 }
 
@@ -60,12 +63,15 @@ export function useConfirmPayment() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (reference: string) =>
-      unwrap(
+      unwrap<ConfirmResponse>(
         await api.post(
           `/api/v1/subscription/payments/${reference}/confirm`,
         ),
       ),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.subscription }),
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: queryKeys.subscription });
+      await qc.refetchQueries({ queryKey: queryKeys.subscription });
+    },
   });
 }
 
@@ -81,7 +87,7 @@ export function useMemes(limit = 20, offset = 0) {
 
 export function usePrepareUpload() {
   return useMutation({
-    mutationFn: async (input: { title: string; filename: string }) =>
+    mutationFn: async (input: { title: string; filename: string; size: number }) =>
       unwrap<UploadResponse>(
         await api.post("/api/v1/memes/upload", input),
       ),

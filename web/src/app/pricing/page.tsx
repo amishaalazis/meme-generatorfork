@@ -1,10 +1,11 @@
 "use client";
 
 // Pricing: daftar paket dari backend; checkout lewat payment gateway mock.
-// NOTE (scaffold): belum ada redirect/confirm UI.
 
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useCheckout, usePlans, useSubscriptionStatus } from "@/lib/queries";
+import { useMe } from "@/lib/auth";
 import { describeError } from "@/lib/errors";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,6 +23,39 @@ export default function PricingPage() {
   const status = useSubscriptionStatus();
   const checkout = useCheckout();
   const router = useRouter();
+  const me = useMe();
+  const idempotencyKeysRef = useRef<Record<string, string>>({});
+  const [selectedPlanCode, setSelectedPlanCode] = useState<string | null>(null);
+
+  const handleCheckout = (planCode: string) => {
+    if (checkout.isPending || selectedPlanCode) return;
+    if (!me.isLoading && !me.data) {
+      router.push("/login");
+      return;
+    }
+    setSelectedPlanCode(planCode);
+
+    // Idempotency-Key dibuat satu per paket (per intent): jika user klik berulang kali
+    // karena internet lemot, key yang sama dikirimkan ke server sehingga server
+    // mengenali maksud yang sama dan tidak membuat checkout ganda.
+    if (!idempotencyKeysRef.current[planCode]) {
+      idempotencyKeysRef.current[planCode] = crypto.randomUUID();
+    }
+    const idempotencyKey = idempotencyKeysRef.current[planCode];
+
+    checkout.mutate(
+      { planCode, idempotencyKey },
+      {
+        onSuccess: (res) => {
+          delete idempotencyKeysRef.current[planCode];
+          router.push(`/checkout/${res.payment.reference}`);
+        },
+        onError: () => {
+          setSelectedPlanCode(null);
+        },
+      },
+    );
+  };
 
   return (
     <main className="mx-auto max-w-4xl space-y-8 p-8">
@@ -63,14 +97,18 @@ export default function PricingPage() {
               </p>
               <Button
                 className="w-full"
-                onClick={() =>
-                  checkout.mutate(plan.code, {
-                    onSuccess: (res) =>
-                      router.push(`/checkout/${res.payment.reference}`),
-                  })
+                disabled={
+                  checkout.isPending ||
+                  Boolean(selectedPlanCode) ||
+                  (status.data?.subscribed && status.data.planName === plan.name)
                 }
+                onClick={() => handleCheckout(plan.code)}
               >
-                Berlangganan
+                {status.data?.subscribed && status.data.planName === plan.name
+                  ? "Paket Aktif"
+                  : checkout.isPending && selectedPlanCode === plan.code
+                    ? "Memproses…"
+                    : "Berlangganan"}
               </Button>
             </CardContent>
           </Card>

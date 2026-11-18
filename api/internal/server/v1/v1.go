@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -30,6 +31,12 @@ func (g subscriptionGate) CanCreate(ctx context.Context, userID string) error {
 	}
 	if !status.Subscribed {
 		return meme.ErrNotSubscribedGate
+	}
+	if status.EndsAt != nil {
+		endsAt, parseErr := time.Parse(time.RFC3339, *status.EndsAt)
+		if parseErr == nil && !endsAt.After(time.Now()) {
+			return meme.ErrNotSubscribedGate
+		}
 	}
 	if status.MaxMemes > 0 && status.MemesUsed >= status.MaxMemes {
 		return meme.ErrNotSubscribedGate

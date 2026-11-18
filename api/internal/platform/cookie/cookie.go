@@ -8,18 +8,23 @@ const (
 	RefreshTokenName = "meme_refresh_token"
 )
 
-func Set(w http.ResponseWriter, name, value string, maxAge int, secure bool) {
+// Set menyimpan cookie dengan HttpOnly=true dan Path="/" agar setiap
+// permintaan dari browser secara otomatis membawa cookie tersebut.
+// HttpOnly=true mencegah JavaScript (termasuk XSS) membaca token langsung.
+func Set(w http.ResponseWriter, name, value string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     "/",
 		MaxAge:   maxAge,
-		HttpOnly: false, // sengaja false agar document.cookie bisa membacanya
-		Secure:   secure,
+		HttpOnly: true,
+		Secure:   false,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
+// Clear menghapus cookie dengan atribut Path dan HttpOnly yang identik
+// dengan Set agar browser benar-benar menghapus cookie tersebut.
 func Clear(w http.ResponseWriter, name string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     name,

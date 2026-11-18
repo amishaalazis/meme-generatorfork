@@ -9,19 +9,21 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useRegister } from "@/lib/auth";
+import { useRegister, useMe } from "@/lib/auth";
 import { apiErrorMessage } from "@/lib/api";
 
 export default function RegisterPage() {
   const router = useRouter();
   const register = useRegister();
+  const me = useMe();
 
-  // BUG: sama seperti /login — cookie ada → lempar ke halaman utama.
+  // Jika sudah login, langsung ke studio. Pakai useMe() bukan document.cookie
+  // karena cookie sekarang HttpOnly (tidak bisa dibaca JS).
   useEffect(() => {
-    if (document.cookie.includes("meme_access_token")) {
-      router.replace("/");
+    if (!me.isLoading && me.data) {
+      router.replace("/studio");
     }
-  }, [router]);
+  }, [me.isLoading, me.data, router]);
 
   const form = useForm({
     defaultValues: { name: "", email: "", password: "" },
@@ -116,7 +118,7 @@ export default function RegisterPage() {
               </p>
             )}
 
-            <Button type="submit" className="w-full" disabled={register.isPending}>
+            <Button type="submit" className="w-full" disabled={register.isPending || me.isLoading}>
               {register.isPending ? "Memproses…" : "Daftar"}
             </Button>
             <p className="text-center text-sm text-muted-foreground">

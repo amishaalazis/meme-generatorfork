@@ -6,6 +6,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/nyxsr/meme-portal/api/internal/config"
@@ -32,15 +33,21 @@ func NewService(repo *Repository, s3Client *s3.Client, cfg config.StorageConfig,
 
 // PrepareUpload membuat record meme (pending) dan mengembalikan presigned PUT URL
 // untuk mengunggah gambar dasar langsung ke S3/Garage.
-func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext, contentType string) (UploadResponse, error) {
+func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext string, size int64, contentType string) (UploadResponse, error) {
 	if err := s.gate.CanCreate(ctx, userID); err != nil {
 		return UploadResponse{}, err
 	}
-	// BUG: tidak ada allowlist ekstensi dan tidak ada batas ukuran file.
-	// Semua tipe file lolos (pdf, zip, html, exe) dan presigned PUT tanpa
-	// Content-Length berarti ukurannya tak terbatas. Fix: validasi ext
-	// (allowedExt) + batas ukuran di presign/handler.
-	objectKey := fmt.Sprintf("base/%s%s", token.RandomHex(12), strings.ToLower(ext))
+	if !allowedExt(ext) || size <= 0 {
+		return UploadResponse{}, ErrInvalidFile
+	}
+	if size > maxUploadBytes {
+		return UploadResponse{}, ErrUploadTooLarge
+	}
+	if contentType != "" && !allowedContentType(contentType) {
+		return UploadResponse{}, ErrInvalidFile
+	}
+	ext = strings.ToLower(ext)
+	objectKey := fmt.Sprintf("base/%s%s", token.RandomHex(12), ext)
 
 	m, err := s.repo.Create(ctx, Meme{
 		UserID: userID, Title: title,
@@ -50,18 +57,24 @@ func (s *Service) PrepareUpload(ctx context.Context, userID, title, ext, content
 		return UploadResponse{}, err
 	}
 
+	uploadContentType := contentTypeForExt(ext)
 	presign := s3.NewPresignClient(s.s3)
-	input := &s3.PutObjectInput{Bucket: &s.bucket, Key: &objectKey}
-	// ContentType diambil mentah dari klien tanpa validasi allowlist —
-	// klien bisa memilih text/html dsb.
-	if contentType != "" {
-		input.ContentType = &contentType
+	input := &s3.PutObjectInput{
+		Bucket:        &s.bucket,
+		Key:           &objectKey,
+		ContentLength: aws.Int64(size),
+		ContentType:   aws.String(uploadContentType),
 	}
 	req, err := presign.PresignPutObject(ctx, input, s3.WithPresignExpires(maxPresignTTL))
 	if err != nil {
 		return UploadResponse{}, fmt.Errorf("meme service: presign gagal: %w", err)
 	}
-	return UploadResponse{ID: m.ID, UploadURL: req.URL, BaseURL: m.BaseImageURL}, nil
+	return UploadResponse{
+		ID:          m.ID,
+		UploadURL:   req.URL,
+		BaseURL:     m.BaseImageURL,
+		ContentType: uploadContentType,
+	}, nil
 }
 
 // ResultUpload mengembalikan presigned PUT URL untuk gambar hasil render
@@ -84,7 +97,12 @@ func (s *Service) ResultUpload(ctx context.Context, userID, id string) (UploadRe
 	if err != nil {
 		return UploadResponse{}, fmt.Errorf("meme service: presign gagal: %w", err)
 	}
-	return UploadResponse{ID: id, UploadURL: req.URL, BaseURL: s.publicURL(objectKey)}, nil
+	return UploadResponse{
+		ID:          id,
+		UploadURL:   req.URL,
+		BaseURL:     s.publicURL(objectKey),
+		ContentType: "image/png",
+	}, nil
 }
 
 func (s *Service) Complete(ctx context.Context, userID, id, resultURL string) (Meme, error) {
@@ -116,10 +134,32 @@ func (s *Service) publicURL(key string) string {
 	return strings.TrimRight(s.baseURL, "/") + "/" + path.Clean(key)
 }
 
+var imageContentTypes = map[string]string{
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+}
+
 func allowedExt(ext string) bool {
-	switch strings.ToLower(ext) {
-	case ".jpg", ".jpeg", ".png", ".gif", ".webp":
-		return true
+	_, ok := imageContentTypes[strings.ToLower(ext)]
+	return ok
+}
+
+func contentTypeForExt(ext string) string {
+	return imageContentTypes[strings.ToLower(ext)]
+}
+
+func allowedContentType(contentType string) bool {
+	if i := strings.IndexByte(contentType, ';'); i >= 0 {
+		contentType = contentType[:i]
+	}
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	for _, allowed := range imageContentTypes {
+		if contentType == allowed {
+			return true
+		}
 	}
 	return false
 }

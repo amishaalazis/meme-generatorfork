@@ -51,9 +51,20 @@ func (s *Service) Checkout(ctx context.Context, userID string, dto CheckoutDTO, 
 		return CheckoutResponse{}, ErrAlreadySubscribed
 	}
 
+	// Cegah tagihan ganda: jika sudah ada checkout pending untuk paket yang sama,
+	// kembalikan checkout yang sudah ada tersebut alih-alih membuat baris baru.
+	if prev, ok, err := s.repo.PendingByUserAndPlan(ctx, userID, plan.ID); err != nil {
+		return CheckoutResponse{}, err
+	} else if ok {
+		return prev, nil
+	}
+
 	reference := token.RandomHex(12)
 	sub, pay, err := s.repo.CreateSubscription(ctx, userID, plan, reference, idempotencyKey)
 	if err != nil {
+		if prev, ok, lerr := s.repo.CheckoutByIdempotencyKey(ctx, idempotencyKey); lerr == nil && ok {
+			return prev, nil
+		}
 		return CheckoutResponse{}, err
 	}
 	url, err := s.gateway.CreateCharge(ctx, pay.AmountIDR, reference)
@@ -77,6 +88,9 @@ func (s *Service) MarkExpired(ctx context.Context) (int64, error) {
 func (s *Service) Status(ctx context.Context, userID string) (SubscriptionStatus, error) {
 	sub, plan, err := s.repo.ActiveByUser(ctx, userID)
 	if err == nil {
+		if sub.EndsAt != nil && !sub.EndsAt.After(time.Now()) {
+			return SubscriptionStatus{Subscribed: false, MemesUsed: 0, MaxMemes: 0}, nil
+		}
 		used, err := s.repo.MemesUsed(ctx, userID, time.Now().AddDate(0, 0, -int(plan.Duration)))
 		if err != nil {
 			return SubscriptionStatus{}, err
